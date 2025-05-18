@@ -21,6 +21,7 @@ class lambda_schedule:
 
   def get_current_lambda(self, i):
     pass
+
 class lambda_schedule_linear(lambda_schedule):
   def __init__(self, start_lamb=1.0, end_lamb=0.0):
     super().__init__()
@@ -823,3 +824,180 @@ def get_pc_radon_ADMM_TV_mri(sde, predictor, corrector, inverse_scaler, snr, mas
             return inverse_scaler(x_mean if denoise else x)
 
     return pc_radon
+
+def get_pc_radon_proximal(sde, predictor, corrector, inverse_scaler, snr,
+                          n_steps=1, probability_flow=False, continuous=False,
+                          denoise=True, eps=1e-5, radon=None, save_progress=False, save_root=None,
+                          final_consistency=False, lambda_sched=None, cg_iter=10):
+    """ 
+    DiffusionProximal-MBIR: Uses proximal regularization instead of TV regularization
+    
+    The approach solves:
+    min_x ||y - Ax||²_2 + λ_i||x - x'_{i-1}||²_2
+    
+    where x'_{i-1} is the output from the diffusion model at step i-1
+    """
+    # Define predictor & corrector
+    predictor_update_fn = functools.partial(shared_predictor_update_fn,
+                                            sde=sde,
+                                            predictor=predictor,
+                                            probability_flow=probability_flow,
+                                            continuous=continuous)
+    corrector_update_fn = functools.partial(shared_corrector_update_fn,
+                                            sde=sde,
+                                            corrector=corrector,
+                                            continuous=continuous,
+                                            snr=snr,
+                                            n_steps=n_steps)
+    
+    # Set default lambda schedule if not provided
+    if lambda_sched is None:
+        lambda_sched = lambda_schedule_const(lamb=1.0)
+    
+    eps_cg = 1e-10  # Small number for CG convergence check
+
+    def _A(x):
+        return radon.A(x)
+
+    def _AT(sinogram):
+        return radon.AT(sinogram)
+
+    def kaczmarz(x, x_mean, measurement=None, lamb=1.0, i=None,
+                 norm_const=None):
+        """Final consistency step using Kaczmarz method"""
+        x = x + lamb * _AT(measurement - _A(x)) / norm_const
+        x_mean = x
+        return x, x_mean
+    
+    def A_cg(x, lamb):
+        """Linear operator (A^T*A + lambda*I)x"""
+        return _AT(_A(x)) + lamb * x
+
+    def CG(A_fn, b_cg, x, lamb, n_inner=10):
+        """
+        Conjugate Gradient solver for (A^T*A + lambda*I)x = b
+        A_fn: function that computes (A^T*A + lambda*I)x
+        b_cg: right hand side (A^T*y + lambda*x')
+        x: initial guess
+        lamb: regularization parameter
+        n_inner: number of CG iterations
+        """
+        r = b_cg - A_fn(x, lamb)
+        p = r
+        rs_old = torch.matmul(r.view(1, -1), r.view(1, -1).T)
+
+        for i in range(n_inner):
+            Ap = A_fn(p, lamb)
+            a = rs_old / torch.matmul(p.view(1, -1), Ap.view(1, -1).T)
+
+            x += a * p
+            r -= a * Ap
+
+            rs_new = torch.matmul(r.view(1, -1), r.view(1, -1).T)
+            if torch.sqrt(rs_new) < eps_cg:
+                break
+            p = r + (rs_new / rs_old) * p
+            rs_old = rs_new
+        return x
+
+    def proximal_update(x_prime, measurement, lamb):
+        """
+        Solve the proximal problem:
+        x = argmin_x ||y - Ax||^2_2 + lamb||x - x_prime||^2_2
+        
+        This has the closed form solution:
+        (A^T*A + lamb*I)x = A^T*y + lamb*x_prime
+        
+        We solve it using conjugate gradient.
+        """
+        with torch.no_grad():
+            ATy = _AT(measurement)
+            b_cg = ATy + lamb * x_prime
+            x = CG(A_cg, b_cg, x_prime, lamb, n_inner=cg_iter)
+            x_mean = x
+            return x, x_mean
+
+    def get_update_fn(update_fn):
+        """Wrapper for predictor/corrector update functions"""
+        def radon_update_fn(model, data, x, t):
+            with torch.no_grad():
+                vec_t = torch.ones(x.shape[0], device=x.device) * t
+                x, x_mean = update_fn(x, vec_t, model=model)
+                return x, x_mean
+        return radon_update_fn
+
+    def get_proximal_fn():
+        """Wrapper for proximal update function"""
+        def proximal_fn(model, data, x, t, measurement=None, lamb=1.0):
+            with torch.no_grad():
+                x, x_mean = proximal_update(x, measurement, lamb)
+                return x, x_mean
+        return proximal_fn
+
+    predictor_update_wrapper = get_update_fn(predictor_update_fn)
+    corrector_update_wrapper = get_update_fn(corrector_update_fn)
+    proximal_update_wrapper = get_proximal_fn()
+
+    def pc_radon_proximal(model, data, measurement=None):
+        """
+        Main function for DiffusionProximal-MBIR reconstruction
+        
+        Algorithm steps:
+        1. Sample from prior
+        2. For each timestep:
+           a. Run predictor on current state
+           b. Run corrector on current state
+           c. Run proximal update with lambda_i
+        3. Apply final consistency if requested
+        """
+        with torch.no_grad():
+            # Initialize from prior
+            x = sde.prior_sampling(data.shape).to(data.device)
+
+            # For final consistency step
+            ones = torch.ones_like(x).to(data.device)
+            norm_const = _AT(_A(ones))
+            
+            # Define timesteps
+            timesteps = torch.linspace(sde.T, eps, sde.N)
+            
+            # Main loop
+            for i in tqdm(range(sde.N)):
+                t = timesteps[i]
+                # Get current lambda from scheduler
+                curr_lamb = lambda_sched.get_current_lambda(i)
+                
+                # 1. Batchify for GPU memory efficiency
+                x_batch = batchfy(x, 12)
+                
+                # 2. Run diffusion model steps for each batch
+                x_agg = list()
+                for idx, x_batch_sing in enumerate(x_batch):
+                    # Predictor step
+                    x_batch_sing, _ = predictor_update_wrapper(model, data, x_batch_sing, t)
+                    # Corrector step
+                    x_batch_sing, _ = corrector_update_wrapper(model, data, x_batch_sing, t)
+                    x_agg.append(x_batch_sing)
+                
+                # 3. Aggregate batches
+                x_prime = torch.cat(x_agg, dim=0)
+                
+                # 4. Run proximal update step
+                x, x_mean = proximal_update_wrapper(model, data, x_prime, t, 
+                                                  measurement=measurement, 
+                                                  lamb=curr_lamb)
+
+                # Save progress if requested
+                if save_progress:
+                    if (i % 50) == 0:
+                        print(f'iter: {i}/{sde.N}, lambda: {curr_lamb:.4f}')
+                        if save_root is not None:
+                            plt.imsave(save_root / 'recon' / f'progress{i}.png', clear(x_mean[0:1]), cmap='gray')
+            
+            # Final consistency step if requested
+            if final_consistency:
+                x, x_mean = kaczmarz(x, x_mean, measurement, lamb=1.0, norm_const=norm_const)
+
+            return inverse_scaler(x_mean if denoise else x)
+
+    return pc_radon_proximal

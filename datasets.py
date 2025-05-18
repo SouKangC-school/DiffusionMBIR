@@ -223,7 +223,7 @@ class fastmri_knee(Dataset):
 class AAPM(Dataset):
   def __init__(self, root, sort):
     self.root = root
-    self.data_list = list(root.glob('full_dose/*.npy'))
+    self.data_list = list(root.glob('*.npy'))
     self.sort = sort
     if sort:
       self.data_list = sorted(self.data_list)
